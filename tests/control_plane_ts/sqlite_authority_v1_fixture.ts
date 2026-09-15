@@ -19,7 +19,7 @@ import {sqliteAuthorityRuntime} from "../../loopx/control_plane/coordination/sql
 
 export const SQLITE_AUTHORITY_STORE_V1_FIXTURE_SCHEMA = "loopx_sqlite_authority_store_v0";
 
-const INSTALL = `
+export const SQLITE_AUTHORITY_V1_FIXTURE_DDL = `
 CREATE TABLE metadata (
   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
   schema_version TEXT NOT NULL, goal_id TEXT NOT NULL, store_identity TEXT NOT NULL
@@ -56,6 +56,50 @@ export interface SqliteAuthorityV1Store {
   }[];
 }
 
+function installV1Database(path: string, goalId: string, identity: string): DatabaseSync {
+  const {driver: sqlite} = sqliteAuthorityRuntime();
+  const db: DatabaseSync = new sqlite.DatabaseSync(path);
+  try {
+    db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
+    db.exec("BEGIN IMMEDIATE");
+    db.exec(SQLITE_AUTHORITY_V1_FIXTURE_DDL);
+    db.prepare("INSERT INTO metadata VALUES (1, ?, ?, ?)")
+      .run(SQLITE_AUTHORITY_STORE_V1_FIXTURE_SCHEMA, goalId, identity);
+    return db;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* the closing handle abandons the transaction */ }
+    db.close();
+    throw error;
+  }
+}
+
+function v1Identity(candidate: string | undefined): string {
+  const identity = candidate ?? `sqlite:${randomUUID().replaceAll("-", "")}`;
+  if (!/^sqlite:[0-9a-f]{32}$/.test(identity)) throw new Error("V1 authority fixture identity is invalid");
+  return identity;
+}
+
+/**
+ * A version-1 database that published only its schema and metadata.
+ *
+ * The shipped V1 provider created the database on its first write-path open,
+ * so a goal that never committed left exactly this state behind: a valid
+ * database with no retained transaction and no head row.
+ */
+export function createEmptySqliteAuthorityStoreV1(
+  directory: string,
+  goalId: string,
+  options: {storeIdentity?: string} = {},
+): {path: string; identity: string} {
+  const path = sqliteAuthorityPath(directory, goalId);
+  if (existsSync(path)) throw new Error("V1 authority fixture refuses to overwrite a database");
+  mkdirSync(dirname(path), {recursive: true, mode: 0o700});
+  const identity = v1Identity(options.storeIdentity);
+  const db = installV1Database(path, goalId, identity);
+  try { db.exec("COMMIT"); } finally { db.close(); }
+  return {path, identity};
+}
+
 export function createSqliteAuthorityStoreV1(
   directory: string,
   goalId: string,
@@ -63,21 +107,14 @@ export function createSqliteAuthorityStoreV1(
   options: {storeIdentity?: string} = {},
 ): SqliteAuthorityV1Store {
   if (seeds.length === 0) throw new Error("V1 authority fixture needs at least one commit");
-  const {driver: sqlite} = sqliteAuthorityRuntime();
   const path = sqliteAuthorityPath(directory, goalId);
   if (existsSync(path)) throw new Error("V1 authority fixture refuses to overwrite a database");
   mkdirSync(dirname(path), {recursive: true, mode: 0o700});
-  const identity = options.storeIdentity ?? `sqlite:${randomUUID().replaceAll("-", "")}`;
-  if (!/^sqlite:[0-9a-f]{32}$/.test(identity)) throw new Error("V1 authority fixture identity is invalid");
-  const db: DatabaseSync = new sqlite.DatabaseSync(path);
+  const identity = v1Identity(options.storeIdentity);
+  const db = installV1Database(path, goalId, identity);
   const rows: {cursor: string; operation_id: string; commit_digest: string;
     operation_receipt: Record<string, unknown>}[] = [];
   try {
-    db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
-    db.exec("BEGIN IMMEDIATE");
-    db.exec(INSTALL);
-    db.prepare("INSERT INTO metadata VALUES (1, ?, ?, ?)")
-      .run(SQLITE_AUTHORITY_STORE_V1_FIXTURE_SCHEMA, goalId, identity);
     const insert = db.prepare("INSERT INTO commits VALUES (?, ?, ?, ?, ?, ?)");
     for (const [index, seed] of seeds.entries()) {
       const cursor = BigInt(index + 1);

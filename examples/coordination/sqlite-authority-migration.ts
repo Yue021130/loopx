@@ -4,9 +4,12 @@
  * Qualification: `--directory` must point at the runtime directory that owns
  * the goal's `authority/<profile>` database. The migration reads that one
  * database, proves every retained commit while writing the bounded state log,
- * and swaps tables only inside the same transaction. Nothing else in the
- * runtime is touched, so a planned run is always safe and an executed run is
- * reversible by restoring the pre-migration database copy the operator keeps.
+ * and swaps tables only inside the same transaction. `--expected-identity`
+ * additionally refuses any database whose stored incarnation is not the one
+ * the operator names, so a renamed or recreated goal directory cannot be
+ * rewritten by accident. Nothing else in the runtime is touched, so a planned
+ * run is always safe and an executed run is reversible by restoring the
+ * pre-migration database copy the operator keeps.
  */
 import {existsSync, writeFileSync} from "node:fs";
 import {parseArgs} from "node:util";
@@ -15,7 +18,7 @@ import {migrateSqliteAuthorityStoreV1ToV2} from
   "../../loopx/control_plane/coordination/sqlite_authority_migration.ts";
 
 const {values: options} = parseArgs({options: {
-  directory: {type: "string"}, goal: {type: "string"}, execute: {type: "boolean", default: false},
+  directory: {type: "string"}, "goal-id": {type: "string"}, execute: {type: "boolean", default: false},
   "expected-identity": {type: "string"}, format: {type: "string", default: "json"},
   output: {type: "string"},
 }});
@@ -25,12 +28,13 @@ const report = (reason: string): {schema_version: string; status: string; reason
     reason_code: "migration_invocation_invalid", reason});
 
 const directory = options.directory;
-const goal = options.goal;
-const result = directory === undefined || goal === undefined
-  ? report("--directory and --goal are required")
-  : migrateSqliteAuthorityStoreV1ToV2(directory, goal, {
+const goalId = options["goal-id"];
+const expectedIdentity = options["expected-identity"];
+const result = directory === undefined || goalId === undefined
+  ? report("--directory and --goal-id are required")
+  : migrateSqliteAuthorityStoreV1ToV2(directory, goalId, {
     execute: options.execute === true,
-    ...(options["expected-identity"] === undefined ? {} : {expected_identity: options["expected-identity"]}),
+    ...(expectedIdentity === undefined ? {} : {expectedIdentity}),
   });
 
 const payload: Record<string, unknown> = {...result,

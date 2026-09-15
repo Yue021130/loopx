@@ -48,11 +48,6 @@ export interface AuthorityStateDelta {
   operations: readonly AuthorityStateOperation[];
 }
 
-export const EMPTY_AUTHORITY_STATE_DELTA: AuthorityStateDelta = {
-  schema_version: AUTHORITY_STATE_DELTA_SCHEMA,
-  operations: [],
-};
-
 function protocol(message: string): never {
   throw new AuthorityStoreProtocolError(message);
 }

@@ -297,6 +297,11 @@ mismatched goal/incarnation or an existing swap target fails closed. Cursors,
 operation IDs, commit digests, provider revisions, receipts, events and scan
 pages are byte-identical after the migration.
 
+A version-1 database that published only its schema and metadata — the state a
+goal leaves behind when it selected the provider and never committed — migrates
+to an equally empty version-2 database instead of failing, so the operator is
+never left with a database that neither provider accepts.
+
 Run it from the repository checkout, with `--execute` omitted for a safe plan:
 
 ```sh
@@ -305,11 +310,12 @@ node --no-warnings --experimental-sqlite --experimental-strip-types \
   --directory "$RUNTIME_ROOT/authority/sqlite-v0" --goal-id example
 ```
 
-Add `--execute` (optionally with `--expected-identity`) to migrate. The entry
-point rewrites only that Goal's database; it does not change provider selection,
-promote a goal, or enable cross-host writes. Keep the pre-migration database
-copy until the promoted Goal has been validated. A production cutover command,
-migration manifest and reverse export remain separate deliverables.
+Add `--execute` (optionally with `--expected-identity`, which refuses a database
+whose stored incarnation is not the one the operator names) to migrate. The
+entry point rewrites only that Goal's database; it does not change provider
+selection, promote a goal, or enable cross-host writes. Keep the pre-migration
+database copy until the promoted Goal has been validated. A production cutover
+command, migration manifest and reverse export remain separate deliverables.
 
 ### Qualification holds / 资格保留项
 
@@ -346,5 +352,7 @@ RSS 和文件大小；没有量到的累计 WAL／逻辑写入和纯锁等待保
 delta”：活跃头读取只用自己的行、对应提交和游标连续性自证，历史读取最多重建一个
 窗口，完整归档由 `verifyAuthorityHistory` 线性审计。版本 1 数据库需要显式迁移
 （`examples/coordination/sqlite-authority-migration.ts`，默认只做 plan，`--execute`
-才写入，失败保持 v1 原样）。迁移不改 cursor、operation id、commit digest、provider
-revision、receipt、event 或 scan 页面字节。
+才写入，`--expected-identity` 可拒绝并非操作者所指的 incarnation，失败保持 v1
+原样）。只发布过 schema 与 metadata、从未提交的 v1 库会迁移成同样为空的 v2 库，
+不会让操作者落在两个 provider 都不接受的状态。迁移不改 cursor、operation id、
+commit digest、provider revision、receipt、event 或 scan 页面字节。

@@ -10,9 +10,10 @@
  * The migration is linear, transactional and idempotent: it reads the frozen
  * V1 rows, proves every stored digest while writing the V2 log, verifies that
  * the retained transaction identity sequence is byte-identical, and only then
- * swaps tables inside the same transaction. Any failure leaves the V1 database
- * untouched. A production first-cutover command, migration manifest and
- * reverse export remain separate reviewed deliverables.
+ * swaps tables inside the same transaction. A V1 database that never committed
+ * migrates to an equally empty V2 database; nothing is invented. Any failure
+ * leaves the V1 database untouched. A production first-cutover command,
+ * migration manifest and reverse export remain separate reviewed deliverables.
  */
 import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
@@ -22,7 +23,7 @@ import type { JsonObject } from "../effect_program.ts";
 import { AuthorityStoreProtocolError, canonicalAuthorityObject,
   canonicalAuthorityObjectList, requireAuthorityStoreId } from "./authority_store_codec.ts";
 import { authorityStateCheckpointCursor, authorityStateDelta,
-  authorityStateDigest } from "./authority_state_log.ts";
+  authorityStateDigest, isAuthorityStateCheckpoint } from "./authority_state_log.ts";
 import {
   SQLITE_AUTHORITY_STORE_SCHEMA,
   commitDigest,
@@ -191,7 +192,7 @@ function executeSqliteAuthorityMigration(
         }
         const stateDigest = authorityStateDigest(projection);
         const delta = authorityStateDelta(previous ?? {}, projection);
-        if (authorityStateCheckpointCursor(cursor) === cursor) {
+        if (isAuthorityStateCheckpoint(cursor)) {
           insertCheckpoint.run(cursor.toString(), JSON.stringify(projection), stateDigest);
           checkpoints += 1;
         }
@@ -203,10 +204,16 @@ function executeSqliteAuthorityMigration(
         commits += 1;
       }
     }
-    if (commits !== inspection.commits || previous === null || previousDigest === null) {
+    if (commits !== inspection.commits) {
       throw new AuthorityStoreProtocolError("V1 authority store changed while it was migrated");
     }
-    db.prepare("INSERT INTO head_v2 VALUES (1, ?, ?, ?)").run(cursor.toString(), JSON.stringify(previous), previousDigest);
+    // A version-1 database that only published its schema and metadata has no
+    // committed projection to re-publish, so version 2 stays empty as well
+    // instead of inventing a head the goal never committed.
+    if (previous !== null && previousDigest !== null) {
+      db.prepare("INSERT INTO head_v2 VALUES (1, ?, ?, ?)").run(cursor.toString(),
+        JSON.stringify(previous), previousDigest);
+    }
     // Swap only after every retained row was proved and re-published.
     db.exec("DROP TABLE head");
     db.exec("DROP TABLE commits");

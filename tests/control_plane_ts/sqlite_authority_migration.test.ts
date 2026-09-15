@@ -13,7 +13,7 @@ import {migrateSqliteAuthorityStoreV1ToV2} from
   "../../loopx/control_plane/coordination/sqlite_authority_migration.ts";
 import {SqliteAuthorityStore} from
   "../../loopx/control_plane/coordination/sqlite_authority_store.ts";
-import {createSqliteAuthorityStoreV1, sqliteAuthorityV1Digest,
+import {createEmptySqliteAuthorityStoreV1, createSqliteAuthorityStoreV1, sqliteAuthorityV1Digest,
   type SqliteAuthorityV1Seed} from "./sqlite_authority_v1_fixture.ts";
 
 const GOAL_ID = "migration-goal";
@@ -166,20 +166,14 @@ test("SQLite V1 migration fails closed when its swap target already exists", asy
 test("SQLite V1 migration runs from its operator entry point", {timeout: 60000}, async t => {
   const root = await directory(t);
   const v1 = createSqliteAuthorityStoreV1(root, GOAL_ID, seeds());
-  const script = fileURLToPath(new URL("../../examples/coordination/sqlite-authority-migration.ts",
-    import.meta.url));
-  const planned = spawnSync(process.execPath, ["--no-warnings", "--experimental-sqlite",
-    "--experimental-strip-types", script, "--directory", root, "--goal", GOAL_ID],
-  {encoding: "utf8"});
+  const planned = runMigrationCli(["--directory", root, "--goal-id", GOAL_ID]);
   assert.equal(planned.status, 0, planned.stderr);
   const plan = JSON.parse(planned.stdout) as Record<string, unknown>;
   assert.equal(plan.status, "planned");
   assert.equal(plan.commits, HISTORY_LENGTH);
   assert.equal(plan.identity, v1.identity);
-  const executed = spawnSync(process.execPath, ["--no-warnings", "--experimental-sqlite",
-    "--experimental-strip-types", script, "--directory", root, "--goal", GOAL_ID, "--execute",
-    "--expected-identity", v1.identity, "--format", "markdown"],
-  {encoding: "utf8"});
+  const executed = runMigrationCli(["--directory", root, "--goal-id", GOAL_ID, "--execute",
+    "--expected-identity", v1.identity, "--format", "markdown"]);
   assert.equal(executed.status, 0, executed.stderr);
   assert.match(executed.stdout, /status: migrated/u);
   assert.match(executed.stdout, new RegExp(`commits: ${HISTORY_LENGTH}`, "u"));
@@ -189,6 +183,54 @@ test("SQLite V1 migration runs from its operator entry point", {timeout: 60000},
   if (head.status === "loaded") assert.equal(head.cursor, String(HISTORY_LENGTH));
   assert.equal((await reopened.verifyAuthorityHistory()).status, "verified");
 });
+
+test("SQLite V1 migration CLI refuses an unnamed incarnation", async t => {
+  const root = await directory(t);
+  const v1 = createSqliteAuthorityStoreV1(root, GOAL_ID, seeds());
+  const before = sqliteAuthorityV1Digest(v1.path, GOAL_ID);
+  const refused = runMigrationCli(["--directory", root, "--goal-id", GOAL_ID, "--execute",
+    "--expected-identity", `sqlite:${"b".repeat(32)}`]);
+  assert.equal(refused.status, 1, refused.stdout);
+  assert.equal((JSON.parse(refused.stdout) as Record<string, unknown>).reason_code,
+    "migration_protocol_violation");
+  assertFrozenV1(v1.path, before);
+});
+
+test("SQLite V1 migration carries an empty database forward without inventing a head", async t => {
+  const root = await directory(t);
+  const v1 = createEmptySqliteAuthorityStoreV1(root, GOAL_ID);
+  assert.equal(migrateSqliteAuthorityStoreV1ToV2(root, GOAL_ID).status, "planned");
+  const migrated = migrateSqliteAuthorityStoreV1ToV2(root, GOAL_ID, {execute: true});
+  assert.equal(migrated.status, "migrated", JSON.stringify(migrated));
+  assert.equal(migrated.commits, 0);
+  assert.equal(migrated.checkpoints, 0);
+  assert.equal(migrated.identity, v1.identity);
+  const store = new SqliteAuthorityStore(root, GOAL_ID, {existingOnly: true, expectedIdentity: v1.identity});
+  assert.deepEqual(await store.loadAuthority(), {status: "missing"});
+  const emptyPage = await store.scanCommitted(null, 4);
+  assert.equal(emptyPage.status, "page");
+  if (emptyPage.status === "page") {
+    assert.deepEqual(emptyPage.transactions, []);
+    assert.equal(emptyPage.has_more, false);
+    assert.equal(emptyPage.next_cursor, null);
+  }
+  // An empty authority database still accepts its first commit.
+  const receipt = await store.commitAuthority({expected_provider_revision: null, operation_id: "empty-op-001",
+    next_projection: {authority_revision: 1, todos: []}, events: [], receipts: []});
+  assert.equal(receipt.status, "applied", JSON.stringify(receipt));
+  assert.equal(receipt.status === "applied" ? receipt.cursor : null, "1");
+  assert.equal((await store.verifyAuthorityHistory()).status, "verified");
+  assert.deepEqual(await store.loadAuthority(), {status: "loaded",
+    cursor: "1", provider_revision: `${v1.identity}:1`, head: {authority_revision: 1, todos: []}});
+  assert.equal(migrateSqliteAuthorityStoreV1ToV2(root, GOAL_ID, {execute: true}).status, "already_current");
+});
+
+function runMigrationCli(args: readonly string[]): {status: number | null; stdout: string; stderr: string} {
+  const script = fileURLToPath(new URL("../../examples/coordination/sqlite-authority-migration.ts",
+    import.meta.url));
+  return spawnSync(process.execPath, ["--no-warnings", "--experimental-sqlite",
+    "--experimental-strip-types", script, ...args], {encoding: "utf8"});
+}
 
 test("SQLite V1 migration refuses a rewritten proof and leaves the database intact", async t => {
   const root = await directory(t);

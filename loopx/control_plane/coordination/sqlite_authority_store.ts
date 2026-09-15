@@ -20,6 +20,7 @@ import {
   authorityStateDigest,
   authorityStateReplayBudget,
   decodeAuthorityStateDelta,
+  isAuthorityStateCheckpoint,
   type AuthorityStateDelta,
 } from "./authority_state_log.ts";
 
@@ -465,7 +466,7 @@ export class SqliteAuthorityStore implements AuthorityStore {
         protocol("SQLite authority state delta does not reconstruct its commit");
       }
       const stateDigest = authorityStateDigest(nextState);
-      if (authorityStateCheckpointCursor(next) === next) {
+      if (isAuthorityStateCheckpoint(next)) {
         db.prepare("INSERT INTO checkpoints VALUES (?, ?, ?)")
           .run(next.toString(), JSON.stringify(nextState), stateDigest);
       }
@@ -581,7 +582,7 @@ export class SqliteAuthorityStore implements AuthorityStore {
           const predecessor: SqliteStateCursor = state ?? {cursor: 0n, projection: {}, digest: ""};
           const replayed: SqliteStateCursor = this.verifyCommitRow(row, identity,
             {kind: "predecessor", state: predecessor}).state;
-          if (authorityStateCheckpointCursor(row.cursor) === row.cursor) {
+          if (isAuthorityStateCheckpoint(row.cursor)) {
             const checkpoint = this.loadCheckpoint(db, row.cursor);
             const sealed = this.verifyCommitRow(row, identity, {kind: "sealed", state: checkpoint}).state;
             if (sealed.digest !== replayed.digest ||
