@@ -970,15 +970,23 @@ fencing/export 演练与 maintainer review 都通过才可晋升。发布紧凑�
 | 新 Goal 默认决策（F） | 维护者接受合格 profile、canary 结果、运维诊断、backup/restore 流程、发布操作说明和关闭默认的路径；在独立且明确披露的发布改动中切默认。 | 仅适用于新建且符合条件的本地 Goal；已有显式 file 选择保持固定。不受支持的 runtime/filesystem 需显式选择支持方案，打开失败不能静默切 backend。 |
 | 已有 Goal 迁移与 file 退役 | 按已评审的 fenced workflow 逐批 opt-in 迁移，每批核对 receipt、历史、投影和回滚；删除路径前列清最后的 file-primary caller 与兼容窗口。 | 每个 Goal 需要明确迁移权限；证据满足后才退役常规 primary 角色。参考／导入／导出支持保留到其 caller 与保留责任分别结束。 |
 
-**当前证据位置（2026-09-13 复核）。** #4121 已合并为
-`bde1632bb6f29aeb9a8b4ac23ead3e98ba2f2f55`，交付第一个候选节点；
-仍需 profile 资格化与晋级，不代表 lane L 完成。
-其 head pointer 有界，operation/cursor 查询有索引，但保留完整历史 projection，连续性
-校验还会统计覆盖索引，因此该成本随历史增长。它验证当前及访问到的 row digest，
-不是每次读取都审计全部历史 payload。资格入口现在区分小型 rehearsal 与显式
-64 KiB 10k/100k 存储轴，记录 p99/样本数、cold CLI、RSS 和 passed/failed/missing
-账本。逻辑/WAL 流量、完整领域负载、大历史恢复和自然时间 soak 的缺口仍阻止晋升，
-工具跑完不等于通过 <=2 增长预算或十天资格。参见
+**当前证据位置（2026-09-15 复核）。** #4121 已合并为
+`bde1632bb6f29aeb9a8b4ac23ead3e98ba2f2f55`，交付第一个候选节点。
+Lane L 中“保留存储有界”的那一半现在有可评审候选：`loopx_sqlite_authority_store_v2`
+改为每 64 次提交一个 checkpoint、每次提交一条精确 delta，不再为每一行保留一份完整
+projection；活跃头由 head 行、对应保留事务和游标连续性自证；单次历史读取最多重建一个
+窗口；完整 delta 链由 `verifyAuthorityHistory` 线性证明。cursor、operation id、commit
+digest、provider revision、receipt、event 与 scan 页面字节均未改变，已发布的版本 1
+数据库通过评审过的 `examples/coordination/sqlite-authority-migration.ts` 入口迁移。
+rehearsal 证据（1000 次提交／64 KiB）现为 16 个 checkpoint、63 次 replay 预算、
+单次历史读取最多重建一个 64 次提交窗口，保留 1,048,576 字节 projection 与
+126,714 字节 delta，而“每提交一份完整拷贝”为 65,536,000 字节。
+
+这仍不代表 lane L 完成。File 与 NoKV 依旧在每次 load 时保留并解码完整 journal，
+因此“有界恢复”是内嵌候选 provider 的性质，不是跨 provider 等价；SQLite profile
+也仍不裁剪 receipt 与 event。逻辑/WAL 流量与 <=15x 累计写入预算、1 MiB 与 300k
+headroom、完整领域负载、大历史恢复、fenced backup/restore、受支持升级/回滚、
+OS/runtime 覆盖和 >=10 天自然时间 soak 仍是 hold，工具跑完不能声称已满足。参见
 [SQLite 验证命令](../../reference/sqlite-authority-store.md#reproduce-validation)。
 公开 Node 最低版本 22.18 继续用于 File；SQLite 另需同步 finalization 与 WAL-reset
 修复，参考组合为 Node 22.22.3／SQLite 3.51.3。Node 24 主 runtime 与 Node 26

@@ -2,8 +2,9 @@
 
 SQLite is an **opt-in local conformance candidate**, behind the existing
 TypeScript `AuthorityStore` interface. File remains the default. This slice
-does not promote a goal, migrate existing authority, enable cross-host writes,
-or qualify ten elapsed days of operation.
+does not promote a goal, run a live cutover, enable cross-host writes, or
+qualify ten elapsed days of operation. It does provide the explicit
+version-1 to version-2 database migration described below.
 
 ## Placement and persistence
 
@@ -18,23 +19,36 @@ directory. Metadata binds the goal, schema version and random database
 incarnation. Provider revisions combine that incarnation with a monotonic
 integer sequence; they are not authority revisions or lease epochs.
 
-The version-1 schema contains:
+The version-2 schema contains:
 
 | Table | Contract |
 | --- | --- |
 | `metadata` | Version and database/goal identity |
-| `head` | One bounded pointer to the current committed projection |
-| `commits` | Unique operation ID, canonical commit digest, ordered cursor, original receipts, events and full projection |
+| `head` | The live committed projection, its state digest and one cursor |
+| `commits` | Unique operation ID, canonical commit digest, ordered cursor, original receipts and events, one exact state delta, its state digest and parent state digest |
+| `checkpoints` | One full projection and its digest per bounded window |
 
 `commits` also serves as the durable projection outbox used by
 `scanCommitted`. There is no independent ACK or second receipt authority.
 Existing consumers resume by cursor. A unique operation index makes receipt
-lookup and cursor paging indexed. The common continuity check counts the compact
-covering index, so total read/write cost is not independent of history length.
-It does not deserialize the complete retained payload history. Historical receipts and full projections are retained without
-pruning. Fixed live state therefore produces linear database growth, not
-bounded total disk use. Growing application projections require separate
+lookup and cursor paging indexed.
+
+Retention is bounded by window instead of by history: every commit keeps one
+exact delta, and one full projection is retained per checkpoint window
+(`authority_state_log.ts`, 64 commits per window). A live read resolves the head
+from the head row, its retained transaction and the cursor bounds; a historical
+read rebuilds at most one window from the covering checkpoint. Retained deltas
+are therefore the only part that still grows with history, and their size is
+proportional to what each commit changed. Original receipts and events are
+retained without pruning, so fixed live state with large receipts still grows
+with history. Growing application projections require separate
 retention/compaction work.
+
+The rehearsal profile measures this profile directly: at 1,000 commits with a
+64 KiB projection, 16 checkpoints retain 1,048,576 projection bytes and 126,714
+delta bytes, against 65,536,000 bytes for one full copy per retained commit.
+Formal 10k/100k evidence still requires the separately authorized matched
+profile.
 
 Writes use `BEGIN IMMEDIATE`, a five-second busy timeout, WAL and
 `synchronous=FULL`. The head, receipt, events and outbox row commit together.
@@ -49,18 +63,29 @@ rotation, corruption repair, or network-filesystem sharing is supported.
 
 ## Read integrity
 
-Authority reads share one SQLite snapshot for metadata, head and requested rows.
-The same check runs inside the write transaction before any new commit row:
-positive unique integer cursors must have `min=1` and `count=max=head`. Thus a
-missing head, rolled-back head, or internal cursor gap is rejected as
-`provider_protocol_violation` before returning authority or accepting a write.
+Authority reads share one SQLite snapshot, and writes run the same live proof
+inside their transaction before publishing a new commit row. The proof is
+layered so that each layer pays only for what it returns:
 
-The newest row's canonical commit digest is recomputed on every authority read
-and write. Historical receipt reads additionally validate their selected row;
-paged scans validate each returned row and the lookahead row used for
-`has_more`. The digest includes the operation ID, projection, events, receipts
-and expected predecessor revision, reconstructed from the unchanged v0 sequence
-contract. No schema migration or alternate digest format is introduced.
+| Layer | Proves | Cost |
+| --- | --- | --- |
+| Live head (`loadAuthority`, `commitAuthority`) | Head row digest over the live projection, the retained transaction at that cursor reproducing its exact commit digest, parent linkage, `min=1`/`count=max=head` cursor continuity, and the presence of the checkpoint that covers the head | One head row, one retained row, one parent digest and index lookups; independent of retained history |
+| Materialized history (`scanCommitted`, `readReceipt`) | Every row from the covering checkpoint through the requested span, including each delta, state digest and parent lineage; paged scans also prove the lookahead row used for `has_more` | At most one checkpoint window plus the requested span |
+| Archive audit (`verifyAuthorityHistory`) | The complete delta chain from the empty root, every checkpoint against retained history, and the final state against the head | Linear in retained history; qualification and recovery only |
+
+A missing head, rolled-back head, internal cursor gap, rewritten receipt/event,
+orphaned parent digest or mismatched state digest is rejected as
+`provider_protocol_violation` before returning authority or accepting a write.
+Preparing a commit also re-applies its own delta and requires byte equality with
+the committed projection before anything is written.
+
+Two shapes are deliberately outside the live proof because the live head never
+reads them: the delta of the newest retained row, and the projection of the
+checkpoint the live head resumes from. Both are refused by every read that
+materializes their span and by the archive audit, and neither can change the
+authority value a live read returns. The commit digest is unchanged from v0
+(operation ID, projection, events, receipts, expected predecessor revision), so
+cursors, provider revisions and stored digests stay comparable.
 
 This is integrity validation of the current and accessed evidence, not a full
 cryptographic audit of every historical payload on each call. Unaccessed older
@@ -192,6 +217,10 @@ npm ci --ignore-scripts
 npm run typecheck:control-plane
 node --no-warnings --experimental-sqlite --experimental-strip-types --test \
   tests/control_plane_ts/sqlite_authority_store.test.ts \
+  tests/control_plane_ts/sqlite_authority_bounded_profile.test.ts \
+  tests/control_plane_ts/sqlite_authority_migration.test.ts \
+  tests/control_plane_ts/authority_state_log.test.ts \
+  tests/control_plane_ts/authority_provider_parity.test.ts \
   tests/control_plane_ts/local_authority_provider.test.ts \
   tests/control_plane_ts/sqlite_runtime_admission.test.ts \
   tests/control_plane_ts/sqlite_capacity.test.ts
@@ -251,8 +280,36 @@ The real-process regressions exercise SIGKILL before and after business COMMIT,
 lost-response receipt readback, exact head/event/receipt/scan equivalence and
 SQLite `max_page_count` exhaustion. These are small disposable-database tests,
 not power-loss, operating-system ENOSPC or large-history recovery qualification.
-The source uses the shared retained-journal snapshot contract. No checkpoint,
-retention deletion, restore-incarnation change or migration format is added.
+Retention deletion, restore-incarnation change and cross-host sharing are still
+absent from this slice.
+
+## Version-1 migration
+
+The shipped version-1 database keeps one full projection per retained row, so it
+cannot be read by the version-2 provider. `sqlite_authority_migration.ts`
+migrates one Goal database in place: it reads the frozen version-1 rows, proves
+every stored commit digest, writes the checkpoint/delta log, proves that each
+written delta reconstructs its projection, requires the commit count to match,
+swaps tables and updates the schema version inside a single
+`BEGIN IMMEDIATE` transaction. Any failure rolls back and leaves version 1
+untouched; a second run reports `already_current`; a rewritten proof, a
+mismatched goal/incarnation or an existing swap target fails closed. Cursors,
+operation IDs, commit digests, provider revisions, receipts, events and scan
+pages are byte-identical after the migration.
+
+Run it from the repository checkout, with `--execute` omitted for a safe plan:
+
+```sh
+node --no-warnings --experimental-sqlite --experimental-strip-types \
+  examples/coordination/sqlite-authority-migration.ts \
+  --directory "$RUNTIME_ROOT/authority/sqlite-v0" --goal-id example
+```
+
+Add `--execute` (optionally with `--expected-identity`) to migrate. The entry
+point rewrites only that Goal's database; it does not change provider selection,
+promote a goal, or enable cross-host writes. Keep the pre-migration database
+copy until the promoted Goal has been validated. A production cutover command,
+migration manifest and reverse export remain separate deliverables.
 
 ### Qualification holds / 资格保留项
 
@@ -263,6 +320,12 @@ and 300k headroom, 24-hour consumer lag, large-history recovery, fenced
 backup/restore, supported upgrades/rollback, OS/runtime coverage and a real
 >=10-day soak. Those holds still block profile promotion. Accelerated volume
 never substitutes for elapsed time, and running this command starts no soak.
+
+Retained state is measured where the formal profile runs: an axis reports its
+checkpoint count, replay budget, recovery tail and retained projection/delta
+bytes, and `bounded_retained_state` compares them against one full copy per
+retained commit. That row stays `missing` for a rehearsal, exactly like every
+other formal budget.
 
 SQLite 资格参考使用 Node 22.22.3／SQLite 3.51.3；打开前同时检查实际 WAL 修复版本
 和 statement 关闭行为。公开 Node 最低版本 22.18 继续用于默认 File 路径。显式
@@ -278,3 +341,10 @@ RSS 和文件大小；没有量到的累计 WAL／逻辑写入和纯锁等待保
 耗尽、长期 consumer backlog 或完整恢复验证。首批测量允许保留 failed/missing；
 >=10 天自然时间 soak、迁移和晋升分别评审与授权。本入口不改变持久格式、Todo
 语义、默认 provider 或任何活跃 Goal。
+
+版本 2 把“每个提交都保留一份完整投影”改成“每个窗口一个检查点 + 每提交一条精确
+delta”：活跃头读取只用自己的行、对应提交和游标连续性自证，历史读取最多重建一个
+窗口，完整归档由 `verifyAuthorityHistory` 线性审计。版本 1 数据库需要显式迁移
+（`examples/coordination/sqlite-authority-migration.ts`，默认只做 plan，`--execute`
+才写入，失败保持 v1 原样）。迁移不改 cursor、operation id、commit digest、provider
+revision、receipt、event 或 scan 页面字节。

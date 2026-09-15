@@ -1231,18 +1231,29 @@ is gated by evidence below, not by calendar dates or this PR's merge status.
 | New-Goal default decision (F) | Maintainers accept the qualified profile and canary results, operational diagnostics, backup/restore procedure, release instructions and default-disable path. Ship the default change in a separate disclosed release change. | Apply only to newly created eligible local Goals. Existing explicit file selections remain pinned. Unsupported runtimes/filesystems require an explicit supported choice; no silent backend switch on open failure. |
 | Existing-Goal migration and file retirement | Migrate opt-in cohorts using the reviewed fenced workflow; reconcile receipts, history, projections and rollback after each cohort. Inventory the last file-primary callers and compatibility windows before removing any path. | Each Goal needs explicit migration authority. Retire file as the ordinary primary only after that evidence; retain reference/import/export support until its own callers and retention duties end. |
 
-**Current evidence position (rechecked 2026-09-13).** #4121 merged as
+**Current evidence position (rechecked 2026-09-15).** #4121 merged as
 `bde1632bb6f29aeb9a8b4ac23ead3e98ba2f2f55`, delivering the first candidate
-milestone. It remains subject to profile qualification and promotion; it is
-not completion of lane L. Its head pointer is bounded and
-operation/cursor lookups are indexed, but it retains full historical projections
-and counts a covering index for continuity. That count grows with history;
-current/accessed-row digests are checked, not every historical payload per read.
-The qualification entrypoint now separates a small rehearsal from an explicit
-64-KiB 10k/100k storage axis, with p99/counts, cold CLI, RSS and a
-passed/failed/missing ledger. Unavailable logical/WAL traffic, full-domain,
-large-history recovery and elapsed-soak evidence remain holds; runner completion
-cannot claim the <=2 growth budget or ten-day qualification. See the
+milestone. The bounded retained-storage half of lane L now has a reviewed
+candidate: `loopx_sqlite_authority_store_v2` keeps one checkpoint per 64-commit
+window plus one exact state delta per commit instead of one full projection copy
+per row, proves the live head from the head row, its retained transaction and
+the cursor bounds, rebuilds at most one window per historical read, and proves
+the complete delta chain through `verifyAuthorityHistory`. Cursors, operation
+IDs, commit digests, provider revisions, receipts, events and scan pages are
+unchanged, and the shipped version-1 databases migrate through the reviewed
+`examples/coordination/sqlite-authority-migration.ts` entry point. Rehearsal
+evidence at 1,000 commits/64 KiB now reports 16 checkpoints, a 63-commit replay
+budget, one checkpoint history read and 1,048,576 retained projection bytes plus
+126,714 delta bytes against 65,536,000 bytes for one copy per commit.
+
+This is still not completion of lane L. File and NoKV continue to retain and
+decode their complete journal on every load, so bounded recovery is a property
+of the embedded candidate rather than cross-provider parity; the SQLite profile
+also still retains receipts and events without pruning. Unavailable logical/WAL
+traffic and the <=15x cumulative write-growth budget, 1 MiB and 300k headroom,
+full-domain workload, large-history recovery, fenced backup/restore, supported
+upgrade/rollback, OS/runtime coverage and the >=10-day elapsed soak remain
+holds, and runner completion cannot claim them. See the
 [SQLite qualification commands](../../reference/sqlite-authority-store.md#reproduce-validation).
 The public minimum remains Node 22.18 for File; SQLite additionally requires
 synchronous finalization and the WAL-reset fix, with Node 22.22.3/SQLite 3.51.3
