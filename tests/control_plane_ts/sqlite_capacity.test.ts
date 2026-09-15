@@ -18,6 +18,11 @@ function axis(count: number): CapacityAxis {
     sample_window: 1000, status: "passed", cleanup_verified: true,
     warm: {commit: sample(1000), head: sample(3000), receipt: sample(2000), scan_100: sample(200)},
     cold_node: sample(20), cold_cli: {mutation: sample(20), status: sample(20), quota: sample(20)},
+    bounded_profile: {schema_version: "loopx_sqlite_authority_bounded_profile_v0", status: "available",
+      cursor: String(count), commits: count, checkpoints: Math.ceil(count / 64), checkpoint_interval: 64,
+      replay_budget_commits: 63, recovery_tail_commits: 0, retained_projection_bytes: 1024,
+      retained_delta_bytes: 1024, retained_payload_bytes: 0, database_bytes: 4096, wal_bytes: 0, shm_bytes: 0},
+    history_audit: {status: "verified", commits: count, checkpoints: Math.ceil(count / 64)},
     application_request_json_bytes: 0, files_at_target: {database_bytes: 0, wal_bytes: 0, shm_bytes: 0},
     sampled_peak_rss_bytes: 0, resource_peak_rss_bytes: 0, fill_seconds: 0, cli_commits: 20};
 }

@@ -15,9 +15,12 @@ import {NoKVAuthorityStore} from "../../loopx/control_plane/coordination/nokv_au
 import {FileAuthorityStore} from "../../loopx/control_plane/coordination/file_authority_store.ts";
 import {SqliteAuthorityStore} from "../../loopx/control_plane/coordination/sqlite_authority_store.ts";
 import type {AuthorityStore} from "../../loopx/control_plane/coordination/authority_store.ts";
+import type {AuthorityStoreScanResult} from "../../loopx/control_plane/coordination/authority_store.ts";
 import {canonicalAuthoritySha256} from "../../loopx/control_plane/coordination/authority_store_codec.ts";
 import {prepareCoordinationProjectionCommit} from "../../loopx/control_plane/coordination/coordination_projection.ts";
-import {productionScaleCoordinationFixture} from "./production_scale_coordination_fixture.ts";
+import {PRODUCTION_SCALE_HISTORY, productionScaleCoordinationFixture,
+  productionScaleHistoryProjection, productionScaleObservationStep} from
+  "./production_scale_coordination_fixture.ts";
 import type {AuthorityProjectionSchema} from "./authority_projection_fixture.ts";
 
 interface BlobState {
@@ -140,5 +143,63 @@ for (const schema of ["legacy", "native"] as const) {
       traces.map(item => item.trace),
       traces.map(() => traces[0]!.trace),
     );
+  });
+}
+
+/**
+ * The same retained history through every local provider.
+ *
+ * Each step is one domain observation over the production-scale projection, so
+ * the comparison covers paged replay of many transactions rather than a single
+ * seed. The prefix is bounded by the fixture because the journal providers
+ * rewrite their complete retained document on every commit.
+ */
+async function historyTrace(store: AuthorityStore, schema: AuthorityProjectionSchema): Promise<string[]> {
+  const fixture = productionScaleHistoryProjection("parity-goal", schema);
+  const plan = PRODUCTION_SCALE_HISTORY;
+  let projection = fixture.projection;
+  let revision: string | null = null;
+  const seeded = await store.commitAuthority({operation_id: "history-seed", expected_provider_revision: null,
+    events: [], receipts: [], next_projection: projection});
+  assert.equal(seeded.status, "applied", JSON.stringify(seeded));
+  if (seeded.status !== "applied") throw new Error("history seed did not apply");
+  revision = seeded.provider_revision;
+  for (let index = 0; index < plan.parity_commit_count; index += 1) {
+    const step = productionScaleObservationStep(projection, index);
+    const prepared = prepareCoordinationProjectionCommit({
+      goal_id: "parity-goal", operation_id: step.operation_id,
+      expected_provider_revision: revision, projection, mutations: [step.mutation],
+    });
+    const applied = await store.commitAuthority(prepared);
+    assert.equal(applied.status, "applied", JSON.stringify(applied));
+    if (applied.status !== "applied") throw new Error("history observation did not apply");
+    revision = applied.provider_revision;
+    projection = prepared.next_projection;
+  }
+  const trace: string[] = [canonicalAuthoritySha256(projection)];
+  let page: AuthorityStoreScanResult = await store.scanCommitted(null, plan.scan_page_size);
+  let pages = 0;
+  while (page.status === "page" && page.transactions.length > 0) {
+    pages += 1;
+    for (const transaction of page.transactions) {
+      trace.push(canonicalAuthoritySha256({operation_id: transaction.operation_id,
+        events: transaction.events, projection: transaction.projection, receipts: transaction.receipts}));
+    }
+    const last = page.transactions[page.transactions.length - 1]!;
+    page = await store.scanCommitted(last.cursor, plan.scan_page_size);
+  }
+  assert.equal(page.status, "page", JSON.stringify(page));
+  assert.equal(trace.length - 1, plan.parity_commit_count + 1);
+  assert.equal(pages, Math.ceil((plan.parity_commit_count + 1) / plan.scan_page_size));
+  return trace;
+}
+
+for (const schema of ["legacy", "native"] as const) {
+  test(`provider parity preserves one long retained history (${schema})`, {timeout: 120000}, async t => {
+    const traces = await Promise.all((await providers(t)).map(async provider => ({
+      name: provider.name,
+      trace: await historyTrace(provider.store, schema),
+    })));
+    assert.deepEqual(traces.map(item => item.trace), traces.map(() => traces[0]!.trace));
   });
 }

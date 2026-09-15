@@ -105,6 +105,7 @@ async function measureAxis(count: number): Promise<CapacityAxis> {
   const axis: CapacityAxis = {target_commits: count, completed_commits: 0, projection_json_bytes: 65536,
     sample_window: Math.min(1000, count), status: "failed", warm: null, cold_node: null, cold_cli: null,
     application_request_json_bytes: 0, files_at_target: null, sampled_peak_rss_bytes: process.memoryUsage().rss,
+    bounded_profile: null, history_audit: null,
     resource_peak_rss_bytes: 0, fill_seconds: 0, cli_commits: 0, cleanup_verified: false};
   const commits: number[] = [], heads: number[] = [], receipts: number[] = [];
   const timed = async <T>(fn: () => Promise<T>, samples?: number[]): Promise<T> => {
@@ -184,6 +185,21 @@ async function measureAxis(count: number): Promise<CapacityAxis> {
     axis.warm = {commit: latency(commits), head: latency(heads), receipt: latency(receipts), scan_100: latency(scans)};
     const bytes = (path: string) => existsSync(path) ? statSync(path).size : 0;
     axis.files_at_target = {database_bytes: bytes(store.path), wal_bytes: bytes(store.path + "-wal"), shm_bytes: bytes(store.path + "-shm")};
+    phase = "bounded_profile";
+    // Retained state and recovery bound of the filled history. The linear
+    // archive audit is only launched where its cost is affordable: it reads
+    // every retained transaction, so the formal 100k axis leaves it to a
+    // separately authorized run.
+    const profile = await store.boundedProfile();
+    if (profile.status !== "available") throw new Error("bounded profile unavailable");
+    axis.bounded_profile = profile;
+    if (!formal) {
+      const audit = await store.verifyAuthorityHistory();
+      axis.history_audit = audit.status === "verified"
+        ? {status: audit.status, commits: audit.commits, checkpoints: audit.checkpoints}
+        : {status: audit.status, commits: 0, checkpoints: 0};
+      assert.equal(audit.status, "verified");
+    }
     phase = "cold_node";
     const cold: number[] = [], samples = formal ? 20 : 3;
     for (let i = 0; i < samples; i++) {

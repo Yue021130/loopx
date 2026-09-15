@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { SqliteAuthorityStore } from "../../loopx/control_plane/coordination/sqlite_authority_store.ts";
+import { AUTHORITY_STATE_CHECKPOINT_INTERVAL } from "../../loopx/control_plane/coordination/authority_state_log.ts";
 import { authorityStoreCommitFixture, registerAuthorityStoreConformance } from "./authority_store_conformance.ts";
 
 async function fixture(t: test.TestContext) {
@@ -16,49 +17,97 @@ async function fixture(t: test.TestContext) {
 }
 registerAuthorityStoreConformance("SQLite", fixture);
 
-test("SQLite head continuity uses exact fast counting instead of row aggregation", async t => {
+test("SQLite head continuity is independent of retained history", {timeout: 30000}, async t => {
   const {store} = await fixture(t);
   assert.equal((await store.storeIdentity()).status, "available");
   const {DatabaseSync} = createRequire(import.meta.url)("node:sqlite");
   const prepare = DatabaseSync.prototype.prepare;
-  let boundsSql = "";
+  let retainedRowsRead = 0;
+  // Count every retained transaction row the hot path materializes, so the
+  // bound is measured on the production entrypoint instead of asserted from
+  // an EXPLAIN plan that a later rewrite could satisfy by another route.
   DatabaseSync.prototype.prepare = function(this: import("node:sqlite").DatabaseSync, sql: string) {
-    if (sql.includes("COUNT(*)")) boundsSql = sql;
-    return prepare.call(this, sql);
+    const statement = prepare.call(this, sql);
+    if (!/FROM commits\b/i.test(sql)) return statement;
+    return new Proxy(statement, {
+      get(target, property) {
+        const value = Reflect.get(target, property);
+        if (typeof value !== "function") return value;
+        if (property !== "all" && property !== "get") return value.bind(target);
+        return (...args: unknown[]) => {
+          const result = value.apply(target, args);
+          retainedRowsRead += Array.isArray(result) ? result.length : result === undefined ? 0 : 1;
+          return result;
+        };
+      },
+    });
   };
-  try { assert.equal((await store.loadAuthority()).status, "missing"); }
-  finally { DatabaseSync.prototype.prepare = prepare; }
-  assert.notEqual(boundsSql, "");
+  let revision: string | null = null;
+  try {
+    for (let i = 1; i <= AUTHORITY_STATE_CHECKPOINT_INTERVAL * 2; i++) {
+      const result = await store.commitAuthority(authorityStoreCommitFixture(revision, `count-${i}`, i, i));
+      assert.equal(result.status, "applied"); if (result.status !== "applied") return;
+      revision = result.provider_revision;
+    }
+    retainedRowsRead = 0;
+    const loaded = await store.loadAuthority();
+    assert.equal(loaded.status, "loaded");
+    if (loaded.status === "loaded") assert.equal(loaded.cursor, String(AUTHORITY_STATE_CHECKPOINT_INTERVAL * 2));
+    // The live head is proven from its own row, its retained transaction and
+    // the cursor bounds, so a window replay is not part of a head read.
+    assert.ok(retainedRowsRead <= 3, `head continuity read ${retainedRowsRead} retained rows`);
+  } finally { DatabaseSync.prototype.prepare = prepare; }
   const db = new DatabaseSync(store.path);
   try {
-    // Inspect the query captured from the production entrypoint. A covering
-    // index alone is insufficient: CAST around the aggregate disables SQLite's
-    // simple-count optimization and visits every retained operation row.
-    const instructions = db.prepare(`EXPLAIN ${boundsSql}`).all();
-    assert(instructions.some((row: {opcode: string}) => row.opcode === "Count"), "head continuity needs SQLite's fast Count path");
-    assert(!instructions.some((row: {opcode: string; p4: unknown}) =>
-      row.opcode === "AggStep" && String(row.p4).startsWith("count(")), "COUNT must not use per-row aggregation");
-    assert.deepEqual({...db.prepare(boundsSql).get()}, {first: null, last: null, count: "0", head: null});
+    const head = db.prepare("SELECT CAST(cursor AS TEXT) AS cursor FROM head WHERE singleton = 1").get() as {cursor: string};
+    // The schema already refuses a head that names no retained row, so the
+    // forged head is written with foreign keys suspended to prove the read
+    // path rejects it on its own evidence.
+    db.exec("PRAGMA foreign_keys=OFF; UPDATE head SET cursor=9223372036854775807");
+    const forged = await store.loadAuthority();
+    assert.equal(forged.status, "failed");
+    if (forged.status === "failed") assert.equal(forged.reason_code, "provider_protocol_violation");
+    db.prepare("UPDATE head SET cursor=? WHERE singleton = 1").run(head.cursor);
+    db.exec("PRAGMA foreign_keys=ON");
+    assert.equal((await store.loadAuthority()).status, "loaded");
+    const emptyDelta = '{"schema_version":"authority_state_delta_v0","operations":[]}';
+    const storedDelta = (cursor: number) =>
+      (db.prepare("SELECT delta FROM commits WHERE cursor = ?").get(cursor) as {delta: string}).delta;
+    const rewriteDelta = (cursor: number, delta: string) =>
+      db.prepare("UPDATE commits SET delta=? WHERE cursor=?").run(delta, cursor);
+    // One delta inside the verified span is proved by every read that returns
+    // a later row, because the chain resumes from the window's checkpoint.
+    const third = storedDelta(3);
+    rewriteDelta(3, emptyDelta);
+    const brokenChain = await store.readReceipt("count-4");
+    assert.equal(brokenChain.status, "failed");
+    rewriteDelta(3, third);
+    // A window anchor resumes from its own checkpoint, so that one row's delta
+    // is proven by the explicit linear archive audit instead of the hot path.
+    const anchor = AUTHORITY_STATE_CHECKPOINT_INTERVAL + 1;
+    const anchorDelta = storedDelta(anchor);
+    rewriteDelta(anchor, emptyDelta);
+    assert.equal((await store.loadAuthority()).status, "loaded");
+    assert.equal((await store.readReceipt("count-1")).status, "found");
+    const tampered = await store.verifyAuthorityHistory();
+    assert.equal(tampered.status, "failed");
+    if (tampered.status === "failed") assert.equal(tampered.reason_code, "provider_protocol_violation");
+    rewriteDelta(anchor, anchorDelta);
+    const audited = await store.verifyAuthorityHistory();
+    assert.equal(audited.status, "verified");
+    if (audited.status === "verified") {
+      assert.equal(audited.commits, AUTHORITY_STATE_CHECKPOINT_INTERVAL * 2);
+      assert.equal(audited.checkpoints, 2);
+    }
+    // A gap inside the live window fails closed on the next read, and the
+    // linear audit cannot skip the missing parent either.
+    db.exec("DELETE FROM commits WHERE cursor=66");
+    const gapped = await store.loadAuthority();
+    assert.equal(gapped.status, "failed");
+    if (gapped.status === "failed") assert.equal(gapped.reason_code, "provider_protocol_violation");
+    const gapAudit = await store.verifyAuthorityHistory();
+    assert.equal(gapAudit.status, "failed");
   } finally { db.close(); }
-  let revision: string | null = null;
-  for (let i = 1; i <= 3; i++) {
-    const result = await store.commitAuthority(authorityStoreCommitFixture(revision, `count-${i}`, i, i));
-    assert.equal(result.status, "applied"); if (result.status !== "applied") return;
-    revision = result.provider_revision;
-  }
-  const reader = new DatabaseSync(store.path);
-  try {
-    assert.deepEqual({...reader.prepare(boundsSql).get()}, {first: "1", last: "3", count: "3", head: "3"});
-    reader.exec("DELETE FROM commits WHERE cursor=2");
-    assert.deepEqual({...reader.prepare(boundsSql).get()}, {first: "1", last: "3", count: "2", head: "3"});
-    reader.exec("BEGIN; PRAGMA defer_foreign_keys=ON; UPDATE commits SET cursor=9223372036854775807 WHERE cursor=3; UPDATE head SET cursor=9223372036854775807; COMMIT");
-    assert.deepEqual({...reader.prepare(boundsSql).get()}, {
-      first: "1", last: "9223372036854775807", count: "2", head: "9223372036854775807",
-    });
-  } finally { reader.close(); }
-  const rejected = await store.loadAuthority();
-  assert.equal(rejected.status, "failed");
-  if (rejected.status === "failed") assert.equal(rejected.reason_code, "provider_protocol_violation");
 });
 
 for (const fault of ["crash-before", "crash-after", "capacity-full"]) {
@@ -118,8 +167,9 @@ for (const changedCursor of [1, 2]) {
   });
 }
 
-for (const corruption of ["projection", "head_rollback", "gap", "receipt", "event", "missing_head", "invalid_json"] as const) {
-  test(`SQLite rejects readable ${corruption} corruption without side effects`, async t => {
+for (const corruption of ["state_digest", "parent_state_digest", "head_rollback", "gap",
+  "receipt", "event", "missing_head", "invalid_json"] as const) {
+  test(`SQLite rejects readable ${corruption} corruption on the live path without side effects`, async t => {
     const {store} = await fixture(t);
     let revision: string | null = null;
     for (let i = 1; i <= 3; i++) {
@@ -129,13 +179,16 @@ for (const corruption of ["projection", "head_rollback", "gap", "receipt", "even
     }
     const {DatabaseSync} = createRequire(import.meta.url)("node:sqlite");
     const db = new DatabaseSync(store.path);
-    if (corruption === "projection") db.prepare("UPDATE commits SET projection=? WHERE cursor=3").run(JSON.stringify({authority_revision: 999}));
+    // Retained transactions no longer carry a second copy of the projection.
+    // Their proof is the exact delta, its state digest, and the parent lineage.
+    if (corruption === "state_digest") db.prepare("UPDATE commits SET state_digest=? WHERE cursor=3").run("0".repeat(64));
+    if (corruption === "parent_state_digest") db.prepare("UPDATE commits SET parent_state_digest=? WHERE cursor=3").run("1".repeat(64));
     if (corruption === "receipt") db.exec("UPDATE commits SET receipts='[{\"operation_id\":\"forged\"}]' WHERE cursor=3");
     if (corruption === "event") db.exec("UPDATE commits SET events='[{\"type\":\"forged\"}]' WHERE cursor=3");
     if (corruption === "head_rollback") db.exec("UPDATE head SET cursor=1");
     if (corruption === "gap") db.exec("DELETE FROM commits WHERE cursor=2");
     if (corruption === "missing_head") db.exec("DELETE FROM head");
-    if (corruption === "invalid_json") db.exec("UPDATE commits SET projection='{' WHERE cursor=3");
+    if (corruption === "invalid_json") db.exec("UPDATE commits SET delta='{' WHERE cursor=3");
     db.close();
     const snapshot = () => {
       const reader = new DatabaseSync(store.path, {readOnly: true});
@@ -146,6 +199,52 @@ for (const corruption of ["projection", "head_rollback", "gap", "receipt", "even
     for (const result of [await store.loadAuthority(), await store.readReceipt("op-1"),
       await store.scanCommitted(null, 1),
       await store.commitAuthority(authorityStoreCommitFixture(revision, "after-corruption", 4, 4))]) {
+      assert.equal(result.status, "failed", JSON.stringify(result));
+      if (result.status === "failed") assert.equal(result.reason_code, "provider_protocol_violation");
+    }
+    assert.deepEqual(snapshot(), before);
+  });
+}
+
+/**
+ * Storage that the live head never reads.
+ *
+ * A window anchor resumes from its own checkpoint and the live head is proven
+ * from its own evidence, so these two shapes are not part of the live read
+ * path. They must still be refused by every read that materializes the
+ * corrupted span and by the linear archive audit, and the store must never
+ * return a projection that the corrupted storage did not produce.
+ */
+for (const corruption of ["delta", "checkpoint_projection"] as const) {
+  test(`SQLite refuses ${corruption} corruption when retained history is materialized`, async t => {
+    const {store} = await fixture(t);
+    let revision: string | null = null;
+    for (let i = 1; i <= 3; i++) {
+      const result = await store.commitAuthority(authorityStoreCommitFixture(revision, `op-${i}`, i, i));
+      assert.equal(result.status, "applied"); if (result.status !== "applied") return;
+      revision = result.provider_revision;
+    }
+    const {DatabaseSync} = createRequire(import.meta.url)("node:sqlite");
+    const db = new DatabaseSync(store.path);
+    if (corruption === "delta") db.prepare("UPDATE commits SET delta=? WHERE cursor=3")
+      .run('{"schema_version":"authority_state_delta_v0","operations":[]}');
+    if (corruption === "checkpoint_projection") db.prepare("UPDATE checkpoints SET projection=? WHERE cursor=1")
+      .run(JSON.stringify({authority_revision: 999}));
+    db.close();
+    const snapshot = () => {
+      const reader = new DatabaseSync(store.path, {readOnly: true});
+      try { return {head: reader.prepare("SELECT * FROM head").all(), commits: reader.prepare("SELECT * FROM commits ORDER BY cursor").all()}; }
+      finally { reader.close(); }
+    };
+    const before = snapshot();
+    const head = await store.loadAuthority();
+    assert.equal(head.status, "loaded", JSON.stringify(head));
+    if (head.status === "loaded") {
+      assert.equal(head.cursor, "3");
+      assert.deepEqual(head.head, authorityStoreCommitFixture(revision, "op-3", 3, 3).next_projection);
+    }
+    for (const result of [await store.readReceipt("op-3"), await store.scanCommitted(null, 10),
+      await store.verifyAuthorityHistory()]) {
       assert.equal(result.status, "failed", JSON.stringify(result));
       if (result.status === "failed") assert.equal(result.reason_code, "provider_protocol_violation");
     }

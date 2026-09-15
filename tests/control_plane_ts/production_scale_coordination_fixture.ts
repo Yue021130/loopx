@@ -27,6 +27,14 @@ const envelope = JSON.parse(readFileSync(new URL(
   linked_decision_count: number;
   completion_target_index: number;
   supersede_target_index: number;
+  history: {
+    commit_count: number;
+    parity_commit_count: number;
+    scan_page_size: number;
+    expected_scan_pages: number;
+    observation_source: string;
+    projection_scope: {agent_todos: number; user_todos: number; leases: number};
+  };
   provider_matrix: {
     default: "file";
     local_profiles: string[];
@@ -40,6 +48,41 @@ const envelope = JSON.parse(readFileSync(new URL(
 
 export const PRODUCTION_SCALE_FIXTURE_SCHEMA =
   "loopx_coordination_production_scale_fixture_v0";
+
+/**
+ * One long retained history over the production-scale projection.
+ *
+ * The projection dimension proves that one transaction reduces a full
+ * production-scale Todo/lease state. This dimension keeps that same state and
+ * appends a deterministic observation history on top of it, so a provider is
+ * exercised with many retained transactions instead of a handful. It stays
+ * provider-neutral on purpose: no field here names a storage window, page
+ * layout or checkpoint interval, because those belong to the provider.
+ */
+export interface ProductionScaleHistoryPlan {
+  readonly commit_count: number;
+  /**
+   * Cross-provider prefix. The journal providers rewrite their complete
+   * retained document on every commit, so the parity smoke stays on a bounded
+   * prefix while the embedded provider runs the full plan.
+   */
+  readonly parity_commit_count: number;
+  readonly scan_page_size: number;
+  readonly expected_scan_pages: number;
+  readonly observation_source: "continuous_monitor";
+  /**
+   * Record counts of the retained-history projection.
+   *
+   * The history projection keeps the production-scale record families and
+   * per-record shapes, and bounds how many records one commit has to reduce.
+   * Reducing the full production-scale projection costs roughly half a second
+   * per domain mutation, which would make hundreds of retained transactions a
+   * multi-minute smoke. Projection scale stays covered by the single-transaction
+   * conformance and parity cases over the full fixture.
+   */
+  readonly projection_scope: {readonly agent_todos: number; readonly user_todos: number;
+    readonly leases: number};
+}
 export const PRODUCTION_SCALE_VALIDATION_DECLARATION = {
   validation_command: null,
   validation_command_argv: ["python3", "-c", "raise SystemExit(0)"],
@@ -264,3 +307,127 @@ export function productionScaleCoordinationFixture(
 }
 
 export const PRODUCTION_SCALE_RETIRED_LEASE_COUNT = envelope.retired_lease_count;
+
+function requireSafeCount(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`production fixture ${label} is not a positive safe integer`);
+  }
+  return value;
+}
+
+/**
+ * Checked while the module loads, so a drifted history envelope fails every
+ * consumer instead of quietly shrinking a provider's retained history.
+ */
+export const PRODUCTION_SCALE_HISTORY: ProductionScaleHistoryPlan = (() => {
+  const plan = envelope.history;
+  if (plan === undefined || plan.observation_source !== "continuous_monitor") {
+    throw new Error("production fixture history observation source is unsupported");
+  }
+  const commit_count = requireSafeCount(plan.commit_count, "history commit count");
+  const scan_page_size = requireSafeCount(plan.scan_page_size, "history scan page size");
+  const parity_commit_count = requireSafeCount(plan.parity_commit_count, "history parity commit count");
+  if (parity_commit_count > commit_count) {
+    throw new Error("production fixture history parity prefix exceeds its commit count");
+  }
+  if (plan.expected_scan_pages !== Math.ceil(commit_count / scan_page_size)) {
+    throw new Error("production fixture history scan page count does not cover its commits");
+  }
+  const scope = plan.projection_scope;
+  if (scope === undefined) throw new Error("production fixture history projection scope is missing");
+  const projection_scope = {
+    agent_todos: requireSafeCount(scope.agent_todos, "history agent Todos"),
+    user_todos: requireSafeCount(scope.user_todos, "history user Todos"),
+    leases: requireSafeCount(scope.leases, "history leases"),
+  };
+  if (projection_scope.agent_todos > envelope.agent_status_counts.done +
+      envelope.agent_status_counts.open + envelope.agent_status_counts.blocked +
+      envelope.agent_status_counts.deferred ||
+      projection_scope.user_todos > envelope.user_status_counts.done +
+      envelope.user_status_counts.open + envelope.user_status_counts.deferred ||
+      projection_scope.leases > envelope.current_lease_count) {
+    throw new Error("production fixture history projection scope exceeds its record families");
+  }
+  return {commit_count, parity_commit_count, scan_page_size, expected_scan_pages: plan.expected_scan_pages,
+    observation_source: plan.observation_source, projection_scope};
+})();
+
+export interface ProductionScaleHistoryProjection {
+  readonly projection: Record<string, unknown>;
+  readonly todo_ids: readonly string[];
+  readonly monitor_ids: readonly string[];
+}
+
+/**
+ * The retained-history projection: production-scale record families and record
+ * shapes at a size that keeps hundreds of retained transactions affordable.
+ */
+export function productionScaleHistoryProjection(
+  goalId: string,
+  schema: AuthorityProjectionSchema = "legacy",
+): ProductionScaleHistoryProjection {
+  const full = productionScaleCoordinationFixture(goalId, "legacy");
+  const scope = PRODUCTION_SCALE_HISTORY.projection_scope;
+  const allTodos = full.projection.todos as Record<string, unknown>[];
+  const agentTodos = allTodos.filter(todo => todo.role === "agent");
+  // Retained history is dominated by live observations, so the slice keeps the
+  // open monitors first and fills the remaining record budget with the other
+  // agent Todos in fixture order.
+  const openMonitors = agentTodos.filter(todo =>
+    todo.status === "open" && todo.task_class === "continuous_monitor");
+  const todos = [...openMonitors, ...agentTodos.filter(todo => !openMonitors.includes(todo))]
+    .slice(0, scope.agent_todos)
+    .concat(allTodos.filter(todo => todo.role === "user").slice(0, scope.user_todos));
+  const todoIds = new Set(todos.map(todo => String(todo.todo_id)));
+  const leases = (full.projection.leases as Record<string, unknown>[])
+    .filter(lease => todoIds.has(String(lease.todo_id))).slice(0, scope.leases);
+  const projection = authorityProjectionFixture(goalId, todos, leases, "legacy",
+    {source_authority: "synthetic_production_scale_history_fixture", handoff_mode: "hard_lease"});
+  const monitor_ids = todos.filter(todo => todo.task_class === "continuous_monitor")
+    .map(todo => String(todo.todo_id));
+  if (monitor_ids.length === 0) {
+    throw new Error("production fixture history projection needs monitor Todos");
+  }
+  return {projection: schema === "legacy" ? projection : projectionFixtureAsSchema(projection, schema),
+    todo_ids: todos.map(todo => String(todo.todo_id)).sort(authorityUnicodeCompare),
+    monitor_ids: monitor_ids.sort(authorityUnicodeCompare)};
+}
+
+export interface ProductionScaleObservationStep {
+  readonly operation_id: string;
+  readonly todo_id: string;
+  readonly mutation: {kind: "todo_upsert"; todo: Record<string, unknown>};
+}
+
+/**
+ * One deterministic monitor observation over an existing projection.
+ *
+ * Every step re-reads the current projection, so callers can apply the same
+ * sequence to any provider and compare the resulting histories exactly. The
+ * mutation is an ordinary domain update: no storage-specific field is touched.
+ */
+export function productionScaleObservationStep(
+  projection: Record<string, unknown>,
+  index: number,
+): ProductionScaleObservationStep {
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new Error("production fixture history step index is invalid");
+  }
+  const todos = projection.todos;
+  if (!Array.isArray(todos)) throw new Error("production fixture history needs a projection");
+  const monitors = (todos as Record<string, unknown>[])
+    .filter(todo => todo.task_class === "continuous_monitor")
+    .sort((left, right) => authorityUnicodeCompare(String(left.todo_id), String(right.todo_id)));
+  if (monitors.length === 0) throw new Error("production fixture history needs monitor Todos");
+  const monitor = monitors[index % monitors.length]!;
+  const generation = Number(monitor.material_change_generation ?? 0) + (index % 3 === 0 ? 1 : 0);
+  const todo: Record<string, unknown> = {...monitor, last_checked_at: observedAt(index),
+    result_hash: `history-observation-${index}`, material_change_generation: generation,
+    consecutive_no_change: String(index % 5)};
+  if (index % 6 === 0) {
+    Object.assign(todo, {material_change: "true", last_actor_agent_id: "agent-a",
+      reason: `history observation ${index}`});
+  }
+  return {operation_id: `history-observation-${String(index).padStart(4, "0")}`,
+    todo_id: String(monitor.todo_id), mutation: {kind: "todo_upsert", todo}};
+}
